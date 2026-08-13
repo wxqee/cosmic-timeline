@@ -1,0 +1,393 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Cosmic Timeline</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body, canvas {
+      display: block; width: 100%; height: 100%;
+      position: fixed; background: #050608; overflow: hidden;
+    }
+    .caption {
+      position: fixed; bottom: 8vh; left: 50%; transform: translateX(-50%);
+      color: rgba(248, 250, 252, 0.92);
+      font-family: -apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', sans-serif;
+      font-size: 22px; font-weight: 400; letter-spacing: 0.06em;
+      text-transform: uppercase; opacity: 0;
+      transition: opacity 0.6s ease;
+      text-shadow: 0 2px 16px rgba(0, 0, 0, 0.9);
+      pointer-events: none; z-index: 10; white-space: nowrap;
+    }
+    .caption.visible { opacity: 1; }
+    @media (max-width: 768px) { .caption { font-size: 16px; bottom: 6vh; } }
+    @media (max-width: 375px) { .caption { font-size: 14px; bottom: 4vh; } }
+  </style>
+</head>
+<body>
+  <canvas id="canvas"></canvas>
+  <div class="caption" id="caption"></div>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/tween.js/18.6.4/tween.umd.js"></script>
+  <script>
+    (function() {
+      var canvas = document.getElementById('canvas');
+      var captionEl = document.getElementById('caption');
+
+      var scene = new THREE.Scene();
+      var camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 0.1, 100);
+      camera.position.set(0, 1.8, 2.8);
+      camera.lookAt(0, 0, 0);
+
+      var renderer = new THREE.WebGLRenderer({ canvas: canvas, antialias: true });
+      renderer.setSize(innerWidth, innerHeight);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+
+      // ── Star texture (soft glow + cross flare) ──
+      function createStarTexture() {
+        var c = document.createElement('canvas');
+        c.width = c.height = 32;
+        var ctx = c.getContext('2d');
+        ctx.fillStyle = '#000'; ctx.fillRect(0, 0, 32, 32);
+        var grd = ctx.createRadialGradient(16, 16, 0, 16, 16, 16);
+        grd.addColorStop(0, '#fff'); grd.addColorStop(1, '#000');
+        ctx.fillStyle = grd; ctx.fillRect(0, 0, 32, 32);
+        ctx.beginPath(); ctx.rect(15, 0, 2, 32); ctx.fill();
+        ctx.beginPath(); ctx.rect(0, 15, 32, 2); ctx.fill();
+        grd = ctx.createRadialGradient(16, 16, 0, 16, 16, 16);
+        grd.addColorStop(0.1, 'rgba(255,255,255,1)');
+        grd.addColorStop(0.6, 'rgba(0,0,0,0)');
+        ctx.fillStyle = grd; ctx.fillRect(0, 0, 32, 32);
+        return new THREE.CanvasTexture(c);
+      }
+      var alphaMap = createStarTexture();
+
+      // ── Shader helpers ──
+      var shaderUtils = [
+        'float random(vec2 st) {',
+        '  return fract(sin(dot(st.xy, vec2(12.9898, 78.233))) * 43758.5453123);',
+        '}',
+        'vec3 scatter(vec3 seed) {',
+        '  float u = random(seed.xy);',
+        '  float v = random(seed.yz);',
+        '  float theta = u * 6.28318530718;',
+        '  float phi = acos(2.0 * v - 1.0);',
+        '  return vec3(sin(phi) * cos(theta), sin(phi) * sin(theta), cos(phi));',
+        '}'
+      ].join('\n');
+
+      // ── Single morphing particle system ──
+      // One system handles Inflation→CMB→First Stars via morphing
+      var COUNT = 16384;
+      var geo = new THREE.BufferGeometry();
+      var pos = new Float32Array(COUNT * 3);
+      var seedArr = new Float32Array(COUNT * 3);
+      var sizeArr = new Float32Array(COUNT);
+      for (var i = 0; i < COUNT; i++) {
+        pos[i * 3] = i / COUNT; // normalized galaxy radius 0..1
+        pos[i * 3 + 1] = 0;
+        pos[i * 3 + 2] = 0;
+        seedArr[i * 3] = Math.random();
+        seedArr[i * 3 + 1] = Math.random();
+        seedArr[i * 3 + 2] = Math.random();
+        sizeArr[i] = Math.random() * 2 + 0.5;
+      }
+      geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+      geo.setAttribute('seed', new THREE.BufferAttribute(seedArr, 3));
+      geo.setAttribute('size', new THREE.BufferAttribute(sizeArr, 1));
+
+      var mat = new THREE.RawShaderMaterial({
+        uniforms: {
+          uTime: { value: 0 },
+          uSize: { value: renderer.getPixelRatio() },
+          uBranches: { value: 4 },           // 4 arms, not 2 (avoid yin-yang)
+          uInflate: { value: 0 },             // 0=point, 1=full CMB spread
+          uMorph: { value: 0 },               // 0=CMB, 1=Galaxy
+          uSpin: { value: 0 },
+          uGalRadius: { value: 1.5 },
+          uRandomness: { value: 0 },
+          uAlpha: { value: 0 },
+          uAlphaMap: { value: alphaMap },
+          uColorCMB: { value: new THREE.Color('#4a5abb') },  // cool blue-purple (brightened)
+          uColorWarm: { value: new THREE.Color('#cc5533') },  // warm CMB spots
+          uColorInn: { value: new THREE.Color('#ff9944') },   // star core warm
+          uColorOut: { value: new THREE.Color('#5566cc') },  // star edge cool
+        },
+        vertexShader: [
+          'precision highp float;',
+          'attribute vec3 position;',
+          'attribute float size;',
+          'attribute vec3 seed;',
+          'uniform mat4 projectionMatrix;',
+          'uniform mat4 modelViewMatrix;',
+          'uniform float uTime, uSize, uBranches, uInflate, uMorph, uSpin, uGalRadius, uRandomness;',
+          'varying float vDist, vMorphT, vIgnite, vCMBFlicker;',
+          '#define PI 3.14159265359',
+          '#define PI2 6.28318530718',
+          shaderUtils,
+          'void main() {',
+          // ── CMB scattered position (uniform spread, not concentrated) ──
+          '  vec3 cmbBase = scatter(seed) * 2.0 * vec3(1.5, 1.0, 1.5);',
+          '  float q = sqrt(random(seed.zx));',  // sqrt = uniform spread (not q^8 = center-heavy)
+          '  cmbBase *= q;',
+          '  float cmbLen = length(cmbBase) / 3.0;',
+          '  vec3 cmbPos = cmbBase * uInflate;',
+
+          // ── Galaxy spiral position ──
+          '  float st = sqrt(position.x);',
+          '  float qt = position.x * position.x;',
+          '  float mt = mix(st, qt, position.x);',
+          '  float angle = qt * uSpin * (2.0 - sqrt(1.0 - qt));',
+          '  float branchOffset = (PI2 / uBranches) * floor(seed.x * uBranches);',
+          '  vec3 galPos;',
+          '  galPos.x = position.x * cos(angle + branchOffset) * uGalRadius;',
+          '  galPos.z = position.x * sin(angle + branchOffset) * uGalRadius;',
+          '  galPos.y = 0.0;',
+          '  galPos += scatter(seed) * random(seed.zx) * uRandomness * mt;',
+          '  galPos.y *= 0.5 + qt * 0.5;',
+
+          // ── Staggered morph: each particle transitions at its own time ──
+          '  float starDelay = seed.y * 0.5;',  // spread over first 50% of morph
+          '  float morphT = smoothstep(starDelay, starDelay + 0.35, uMorph);',
+          '  vMorphT = morphT;',
+
+          // Ignition flash: brief brightening when star first forms
+          '  vIgnite = smoothstep(starDelay, starDelay + 0.04, uMorph)',
+          '           * (1.0 - smoothstep(starDelay + 0.04, starDelay + 0.15, uMorph));',
+
+          // CMB flicker: each particle has its own pulse
+          '  vCMBFlicker = 0.6 + 0.4 * sin(uTime * 2.0 + random(seed.xy) * 6.28);',
+
+          // ── Interpolate position ──
+          '  vec3 p = mix(cmbPos, galPos, morphT);',
+
+          // ── Rotation (interpolated) ──
+          '  float rotAngle = mix(uTime * 0.08, uTime * 0.25, morphT);',
+          '  vec3 temp = p;',
+          '  float ac = cos(rotAngle);',
+          '  float as = sin(rotAngle);',
+          '  p.x = temp.x * ac - temp.z * as;',
+          '  p.z = temp.x * as + temp.z * ac;',
+
+          '  vDist = mt;',
+          '  vec4 mvp = modelViewMatrix * vec4(p, 1.0);',
+          '  gl_Position = projectionMatrix * mvp;',
+
+          // ── Size: CMB = large soft, Galaxy = small sharp, ignition boost ──
+          '  float cmbSize = 18.0 * size * uSize * (1.5 - cmbLen * 0.5);',
+          '  float galSize = 10.0 * size * uSize;',
+          '  gl_PointSize = mix(cmbSize, galSize, morphT) / -mvp.z;',
+          '  gl_PointSize *= (1.0 + vIgnite * 0.8);',
+          '}'
+        ].join('\n'),
+        fragmentShader: [
+          'precision highp float;',
+          'uniform vec3 uColorCMB, uColorWarm, uColorInn, uColorOut;',
+          'uniform sampler2D uAlphaMap;',
+          'uniform float uAlpha;',
+          'varying float vDist, vMorphT, vIgnite, vCMBFlicker;',
+          '#define PI 3.14159265359',
+          shaderUtils,
+          'void main() {',
+          '  vec2 uv = vec2(gl_PointCoord.x, 1.0 - gl_PointCoord.y);',
+          '  float a = texture2D(uAlphaMap, uv).g;',
+          '  if (a < 0.02) discard;',
+
+          // CMB color: cool base with ~15% warm spots (seed-based)
+          '  float warmSpot = step(0.85, random(vec2(vDist, vMorphT)));',
+          '  vec3 cmbColor = mix(uColorCMB, uColorWarm, warmSpot * 0.4);',
+          '  cmbColor *= vCMBFlicker;',
+
+          // Galaxy color: warm inner → cool outer + cross flare
+          '  vec3 galColor = mix(uColorInn, uColorOut, vDist);',
+          '  float flare = step(0.99, (sin(gl_PointCoord.x * PI) + sin(gl_PointCoord.y * PI)) * 0.5);',
+          '  galColor = max(galColor, vec3(flare));',
+
+          // Interpolate color
+          '  vec3 color = mix(cmbColor, galColor, vMorphT);',
+
+          // Alpha: CMB = foggy but visible, Galaxy = sharp, ignition boost
+          '  float cmbAlpha = 0.35;',
+          '  float galAlpha = 1.0;',
+          '  float alpha = mix(cmbAlpha, galAlpha, vMorphT);',
+          '  alpha = max(alpha, vIgnite * 0.9);',
+
+          '  gl_FragColor = vec4(color, a * alpha * uAlpha);',
+          '}'
+        ].join('\n'),
+        transparent: true,
+        depthTest: false,
+        depthWrite: false,
+        blending: THREE.AdditiveBlending,
+      });
+      var particles = new THREE.Points(geo, mat);
+      scene.add(particles);
+
+      // ── Inflation flash ──
+      var flashGeo = new THREE.PlaneGeometry(2, 2);
+      var flashMat = new THREE.ShaderMaterial({
+        uniforms: {
+          uIntensity: { value: 0 },
+          uRadius: { value: 0 },
+          uAspectRatio: { value: innerWidth / innerHeight },
+        },
+        vertexShader: [
+          'varying vec2 vUv;',
+          'void main() { vUv = uv; gl_Position = vec4(position, 1.0); }'
+        ].join('\n'),
+        fragmentShader: [
+          'varying vec2 vUv;',
+          'uniform float uIntensity, uRadius, uAspectRatio;',
+          'void main() {',
+          '  vec2 uv = vUv - 0.5;',
+          '  uv.x *= uAspectRatio;',
+          '  float dist = length(uv);',
+          '  float r = max(uRadius, 0.001) * 0.5;',
+          '  float core = smoothstep(r, 0.0, dist) * uIntensity;',
+          '  float ringR = uRadius * 0.8;',
+          '  float ring = smoothstep(ringR + 0.05, ringR, dist) * smoothstep(ringR - 0.15, ringR, dist) * uIntensity * 0.6;',
+          '  float halo = smoothstep(r * 3.0, 0.0, dist) * uIntensity * 0.2;',
+          '  vec3 color = mix(vec3(1.0, 0.8, 0.6), vec3(1.0, 1.0, 0.98), core);',
+          '  float alpha = (core + ring + halo) * 0.9;',
+          '  if (alpha < 0.005) discard;',
+          '  gl_FragColor = vec4(color, alpha);',
+          '}'
+        ].join('\n'),
+        transparent: true, depthTest: false, depthWrite: false,
+      });
+      var flash = new THREE.Mesh(flashGeo, flashMat);
+      flash.position.z = -0.5;
+      scene.add(flash);
+
+      // ── Caption ──
+      function setCaption(text) {
+        if (captionEl.textContent !== text) {
+          captionEl.classList.remove('visible');
+          setTimeout(function() {
+            captionEl.textContent = text;
+            if (text) captionEl.classList.add('visible');
+          }, 150);
+        }
+      }
+
+      // ── Timeline (10s, 3 phases) ──
+      var U = mat.uniforms;
+      var UF = flashMat.uniforms;
+      var timers = [];
+      function addTimer(fn, ms) { timers.push(setTimeout(fn, ms)); }
+      function clearTimers() { timers.forEach(clearTimeout); timers = []; }
+
+      function runCycle() {
+        clearTimers();
+        // Reset
+        U.uInflate.value = 0;
+        U.uMorph.value = 0;
+        U.uSpin.value = 0;
+        U.uRandomness.value = 0;
+        U.uAlpha.value = 0;
+        UF.uIntensity.value = 0;
+        UF.uRadius.value = 0;
+        particles.rotation.y = 0;
+        camera.position.set(0, 1.8, 2.8);
+        camera.lookAt(0, 0, 0);
+        renderer.setClearColor(0x050608, 1);
+
+        // ── Phase 1: Inflation (0 → 2s) ──
+        // Flash + particles expand from center
+        new TWEEN.Tween({ intensity: 0, radius: 0.001, inflate: 0, alpha: 0 })
+          .to({ intensity: 1, radius: 0.15, inflate: 0.05, alpha: 0.3 }, 200)
+          .easing(TWEEN.Easing.Quadratic.Out)
+          .onUpdate(function(o) {
+            UF.uIntensity.value = o.intensity;
+            UF.uRadius.value = o.radius;
+            U.uInflate.value = o.inflate;
+            U.uAlpha.value = o.alpha;
+          })
+          .chain(
+            new TWEEN.Tween({ intensity: 1, radius: 0.15, inflate: 0.05, alpha: 0.3 })
+              .to({ intensity: 0, radius: 1.2, inflate: 1.0, alpha: 0.75 }, 1800)
+              .easing(TWEEN.Easing.Cubic.Out)
+              .onUpdate(function(o) {
+                UF.uIntensity.value = o.intensity;
+                UF.uRadius.value = o.radius;
+                U.uInflate.value = o.inflate;
+                U.uAlpha.value = o.alpha;
+              })
+          )
+          .start();
+
+        // ── Phase 2: CMB (2 → 4.5s) ──
+        // Stable haze, gentle pulsing
+        new TWEEN.Tween({ t: 0 })
+          .to({ t: 1 }, 2500)
+          .delay(2000)
+          .onUpdate(function(o) {
+            U.uAlpha.value = 0.85 + Math.sin(o.t * Math.PI * 3) * 0.06;
+            camera.position.x = Math.sin(o.t * 0.4) * 0.15;
+            camera.position.y = 1.8 + Math.sin(o.t * 0.3) * 0.06;
+            camera.lookAt(0, 0, 0);
+          })
+          .start();
+
+        // ── Phase 3: First Stars (4 → 9.5s) ──
+        // Particles morph from CMB scattered → galaxy spiral
+        // Each particle ignites at its own time (staggered)
+        // No separate "condensation" phase - morph IS the star formation
+        new TWEEN.Tween({ morph: 0, spin: 0, rand: 0, rotate: 0 })
+          .to({ morph: 1, spin: Math.PI * 2.5, rand: 0.45, rotate: Math.PI * 2 }, 5500)
+          .delay(4000)
+          .easing(TWEEN.Easing.Cubic.InOut)
+          .onUpdate(function(o) {
+            U.uMorph.value = o.morph;
+            U.uSpin.value = o.spin;
+            U.uRandomness.value = o.rand;
+            particles.rotation.y = o.rotate;
+            // CMB haze gradually dissipated by star formation
+            // (handled by morphT in shader - particles become sharp stars)
+          })
+          .start();
+
+        // ── Captions (3 phases) ──
+        addTimer(function() { setCaption('Inflation'); }, 50);
+        addTimer(function() { setCaption('CMB'); }, 2200);
+        addTimer(function() { setCaption('First Stars'); }, 4200);
+        addTimer(function() { setCaption(''); }, 9500);
+
+        // ── Fade + restart (300ms) ──
+        new TWEEN.Tween({ fade: 0 })
+          .to({ fade: 1 }, 300)
+          .delay(9500)
+          .onUpdate(function(o) {
+            U.uAlpha.value *= (1 - o.fade);
+            renderer.setClearColor(0x050608, 1);
+          })
+          .onComplete(function() {
+            renderer.setClearColor(0x050608, 1);
+            runCycle();
+          })
+          .start();
+      }
+
+      runCycle();
+
+      // ── Render loop ──
+      var clock = new THREE.Clock();
+      renderer.setAnimationLoop(function() {
+        U.uTime.value += clock.getDelta() * 0.5;
+        TWEEN.update();
+        renderer.render(scene, camera);
+      });
+
+      // ── Resize ──
+      addEventListener('resize', function() {
+        camera.aspect = innerWidth / innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(innerWidth, innerHeight);
+        flashMat.uniforms.uAspectRatio.value = innerWidth / innerHeight;
+      });
+    })();
+  </script>
+</body>
+</html>
